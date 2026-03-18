@@ -55,13 +55,14 @@ class HPUPagedAttention:
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """CPU attention supports decoder and encoder-only attention."""
+        """HPU attention supports decoder, encoder-only, and encoder-decoder (cross) attention."""
         from vllm.v1.attention.backend import AttentionType
 
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
             AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER_DECODER,
         )
 
     @staticmethod
