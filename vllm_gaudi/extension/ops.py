@@ -78,12 +78,18 @@ def matmul_shape(lhs, rhs):
 
 def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, sink, batch_size, matmul_av_op,
                  batch2block_matmul_op, block2batch_matmul_op):
+    # This function is the core decode-phase attention kernel site.  It is reached from
+    # flat_pa() and flat_pa_mla() which are called by HPUPagedAttention.forward_decode().
+    # The two HPU-native kernel call sites are:
+    #   1. torch.ops.hpu.block_softmax         – fused per-block softmax (fast path)
+    #   2. torch.ops.hpu.block_softmax_adjustment – rescales block outputs to global softmax
     # When fp32_softmax is enabled attn is left in fp32 after Q@K
     # We can return to native dtype after we renormalize and calculate the adjustments
     if block_bias is not None and attn.dtype != block_bias.dtype:
         block_bias = block_bias.to(dtype=attn.dtype)
     # TODO: w/a with 5D req as the block_softmax kernel does not support 4D attn tensor, which is used in e.g. Granite-3B
     if get_config().fused_block_softmax and get_config().fused_block_softmax_adjustment and attn.dim() == 5:
+        # HPU kernel invocation #1 (decode, fast path): fused per-block softmax
         attn, block_max, block_sums = torch.ops.hpu.block_softmax(attn, block_bias, block_groups)
         if attn.dtype == torch.float32:
             attn = attn.to(value.dtype)
@@ -117,6 +123,7 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, sink, bat
     attn = matmul_av_op(attn, value)
     if get_config().fused_block_softmax_adjustment:
         out_shape = list(attn.shape[:3]) + [1] * (attn.dim() - 3)
+        # HPU kernel invocation #2 (decode): rescales per-block attn outputs to global softmax denominator
         rescale = torch.ops.hpu.block_softmax_adjustment(block_max, block_sums.to(block_max.dtype), block_groups,
                                                          batch_size, out_shape).to(attn.dtype)
     else:
@@ -208,6 +215,10 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
 def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, block_groups, block_size, scale,
             matmul_qk_op, position_bias, matmul_av_op, batch2block_matmul_op, block2batch_matmul_op, keys_fetch_func,
             values_fetch_func, sinks, k_scales, v_scales, **ignored_args):
+    # Decode-phase paged attention entry point (standard attention, no MLA).
+    # Call chain: HPUAttentionImpl.forward() → HPUPagedAttention.forward_decode()
+    #             → flat_pa() → pipelined_pa()
+    # The actual HPU kernel calls occur inside pipelined_pa().
     batch_size, _, hidden_size = query.shape
     _, kv_heads, head_size = key_cache.shape
     q_heads = hidden_size // head_size
@@ -420,6 +431,8 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
     # use sinks in fsdpa
     if sinks is not None:
         args += [sinks]
+    # HPU kernel invocation (prefill, fsdpa_impl path):
+    # fsdpa_op is ModuleFusedSDPA wrapping habana_frameworks.torch.hpex.kernels.FusedSDPA
     attn_weights = fsdpa_op(*args)
 
     attn_weights = attn_weights.transpose(1, 2)
@@ -432,6 +445,12 @@ def prompt_attention(
     impl: str,
     **args,
 ) -> torch.Tensor:
+    # Prefill-phase attention kernel entry point.
+    # Call chain: HPUAttentionImpl.forward() → ops.prompt_attention()
+    # Dispatches to one of three implementations selected by `impl`:
+    #   'fsdpa_impl'  → _fsdpa_prompt_attention() → FusedSDPA HPU kernel (default)
+    #   'naive_impl'  → _naive_prompt_attention()  → pure PyTorch matmul
+    #   'flex_impl'   → _flex_prompt_attention()   → torch.nn.attention.flex_attention
     _get_context(args)
     impl_mapping = {
         'naive_impl': _naive_prompt_attention,

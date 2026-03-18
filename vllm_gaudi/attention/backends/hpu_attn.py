@@ -649,6 +649,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 hasattr(attn_metadata, 'chunked_attn_bias') and attn_metadata.chunked_attn_bias is not None:
                 attn_bias = attn_metadata.chunked_attn_bias
 
+            # Prefill-phase kernel invocation: dispatches to FusedSDPA (fsdpa_impl),
+            # naive PyTorch (naive_impl), or flex_attention (flex_impl).
             out = ops.prompt_attention(impl=self.prefill_impl,
                                        query=query.view(query_shape),
                                        key=key.view(kv_shape),
@@ -693,6 +695,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                         dtype=self.alibi_slopes.dtype,
                     )
 
+            # Decode-phase kernel invocation: → flat_pa() / flat_pa_mla() → pipelined_pa()
+            # which calls torch.ops.hpu.block_softmax and block_softmax_adjustment.
             output = HPUPagedAttention.forward_decode(query=query,
                                                       block_mapping=block_mapping,
                                                       block_bias=attn_bias,
