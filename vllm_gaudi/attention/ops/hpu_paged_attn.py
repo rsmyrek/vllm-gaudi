@@ -55,13 +55,14 @@ class HPUPagedAttention:
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """CPU attention supports decoder and encoder-only attention."""
+        """HPU attention supports decoder, encoder-only, and encoder-decoder (cross) attention."""
         from vllm.v1.attention.backend import AttentionType
 
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
             AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER_DECODER,
         )
 
     @staticmethod
@@ -92,6 +93,11 @@ class HPUPagedAttention:
 
     @staticmethod
     def forward_decode(**kwargs) -> torch.Tensor:
+        # Decode-phase kernel entry point.
+        # Dispatches to flat_pa_mla() (MLA models) or flat_pa() (standard attention).
+        # Both land in pipelined_pa() which invokes the HPU kernels:
+        #   torch.ops.hpu.block_softmax            – fused per-block softmax (fast path)
+        #   torch.ops.hpu.block_softmax_adjustment – rescales blocks to global softmax
         if kwargs.get("kv_lora_rank"):
             return ops.flat_pa_mla(**kwargs)
         return ops.flat_pa(**kwargs)

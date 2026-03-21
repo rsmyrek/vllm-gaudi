@@ -1149,8 +1149,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if isinstance(attn_module, FusedMoE):
                 continue
 
-            # TODO: Support other attention modules, e.g., sliding window,
-            # cross-attention
+            # TODO: Support other attention modules, e.g., sliding window
             if isinstance(attn_module, MambaBase):
                 kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(self.vllm_config)
             elif isinstance(attn_module, Attention):
@@ -1163,7 +1162,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # encoder-only attention does not need KV cache.
                     continue
                 elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
-                    raise NotImplementedError
+                    kv_cache_spec[layer_name] = FullAttentionSpec(block_size=block_size,
+                                                                  num_kv_heads=attn_module.num_kv_heads,
+                                                                  head_size=attn_module.head_size,
+                                                                  dtype=self.kv_cache_dtype)
                 else:
                     raise ValueError(f"Unknown attention type: {attn_module.attn_type}")
             elif isinstance(attn_module, MLAAttention):
@@ -1360,7 +1362,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
             req_index = removed_req_indices.pop() if removed_req_indices else None
-            self.input_batch.add_request(req_state, req_index)
+            req_index = self.input_batch.add_request(req_state, req_index)
+            # Track encoder sequence lengths for encoder-decoder (cross-attention) models.
+            if (self.encoder_seq_lens_np is not None and self._cross_attn_group_id is not None
+                    and self._cross_attn_group_id < len(req_state.block_ids)):
+                n_enc_blocks = len(req_state.block_ids[self._cross_attn_group_id])
+                self.encoder_seq_lens_np[req_index] = n_enc_blocks * self.block_size
 
         # Condense the batched states if there are empty indices.
         if removed_req_indices:
@@ -1819,6 +1826,40 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         block_usage = torch.tensor(block_usage, dtype=self.model_config.dtype, device='cpu')
         return block_list, block_groups, block_usage
 
+    def _get_cross_attn_habana_buffers(self, block_tables: list[list[int]], encoder_seq_lens: list[int],
+                                       batch_size: int):
+        """Build paged attention buffers for cross-attention (encoder K/V) blocks.
+
+        Similar to get_habana_paged_attn_buffers but uses encoder_seq_lens to
+        determine per-block token usage instead of decoder slot mapping.
+        """
+        if not block_tables:
+            empty = torch.empty(0, dtype=torch.long, device='cpu')
+            return empty, empty, torch.empty(0, dtype=self.model_config.dtype, device='cpu')
+
+        last_block_usage = [enc_len % self.block_size or self.block_size for enc_len in encoder_seq_lens]
+        block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
+        block_usage = [[self.block_size] * (len(bt) - 1) + [lbu] for bt, lbu in zip(block_tables, last_block_usage)
+                       if bt]
+        block_list = flatten(block_tables)
+        block_groups = flatten(block_groups)
+        block_usage = flatten(block_usage)
+
+        block_bucket_size = self.bucketing_manager.find_decode_bucket(batch_size, len(block_list))[2]
+        block_bucket_size += self.get_dp_padding(block_bucket_size)
+
+        def padding_fn(tensor, pad_value):
+            return pad_list(tensor, block_bucket_size, itertools.repeat(pad_value))
+
+        block_list = padding_fn(block_list, self._PAD_BLOCK_ID)
+        block_groups = padding_fn(block_groups, -1)
+        block_usage = padding_fn(block_usage, 1)
+
+        block_list = torch.tensor(block_list, dtype=torch.long, device='cpu')
+        block_groups = torch.tensor(block_groups, dtype=torch.long, device='cpu')
+        block_usage = torch.tensor(block_usage, dtype=self.model_config.dtype, device='cpu')
+        return block_list, block_groups, block_usage
+
     def _align_and_pad_mrope_positions(self, req_ids: list[str], context_lens: list[int], query_lens: list[int],
                                        bucketing: tuple[int, int], padding_gen: int) -> torch.Tensor:
         target_bs, target_len = bucketing
@@ -1999,6 +2040,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
+
+    def _get_cross_attention_group_id(self) -> Optional[int]:
+        """Find the KV cache group index containing cross-attention (ENCODER_DECODER) layers.
+
+        Returns the group index if found, None otherwise.
+        """
+        if not self.model_config.is_encoder_decoder:
+            return None
+        forward_ctx = self.vllm_config.compilation_config.static_forward_context
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                attn_module = forward_ctx.get(layer_name)
+                if (attn_module is not None and isinstance(attn_module, Attention)
+                        and attn_module.attn_type == AttentionType.ENCODER_DECODER):
+                    return gid
+        return None
 
     def _extract_prefill_batch_contents(self, num_prefills, num_decodes, num_scheduled_tokens, warmup=False):
         # DECODES are the first num_decodes REQUESTS.
@@ -2267,6 +2324,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         context_blocks_t: Optional[torch.tensor]
         context_blocks_t = async_h2d_copy(context_blocks, dtype=torch.int32).flatten() if target_blocks > 0 else None
 
+        # Build cross-attention slot mapping for encoder-decoder models.
+        cross_slot_mapping = None
+        if self._cross_attn_group_id is not None and len(req_ids) > 0:
+            cross_block_table = self.input_batch.block_table[self._cross_attn_group_id].get_cpu_tensor()
+            cross_slots_per_req = []
+            for i, req_id in enumerate(req_ids):
+                req_idx = self.input_batch.req_id_to_index.get(req_id)
+                if req_idx is None:
+                    cross_slots_per_req.append([])
+                    continue
+                enc_len = int(self.encoder_seq_lens_np[req_idx]) if self.encoder_seq_lens_np is not None else 0
+                if enc_len == 0:
+                    cross_slots_per_req.append([])
+                    continue
+                n_enc_blocks = int(np.ceil(enc_len / self.block_size))
+                cross_blocks = cross_block_table[req_idx, :n_enc_blocks].tolist()
+                slots = [cross_blocks[j // self.block_size] * self.block_size + (j % self.block_size)
+                         for j in range(enc_len)]
+                cross_slots_per_req.append(slots)
+
+            if any(cross_slots_per_req):
+                max_enc_len = max(len(s) for s in cross_slots_per_req)
+                cross_slots_padded = align_and_pad(cross_slots_per_req, (target_bs, max_enc_len),
+                                                   itertools.repeat(self._PAD_SLOT_ID))
+                cross_slot_mapping = async_h2d_copy(cross_slots_padded, dtype=torch.int64)
+
         attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(seq_lens_tensor=query_lens,
                                                                      context_lens_tensor=context_lens,
                                                                      slot_mapping=token_slots,
@@ -2278,7 +2361,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                      last_chunk_indices_p=last_chunk_indices_p,
                                                                      state_indices_tensor=state_indices_tensor,
                                                                      query_start_loc=query_start_loc_p,
-                                                                     padding_mask_flat=padding_mask_flat)
+                                                                     padding_mask_flat=padding_mask_flat,
+                                                                     cross_slot_mapping=cross_slot_mapping)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -2329,7 +2413,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                   num_scheduled_tokens,
                                   context_lens,
                                   block_table_cpu_tensor,
-                                  scheduler_output=None) -> DecodeInputData:
+                                  scheduler_output=None,
+                                  cross_block_table_cpu_tensor=None,
+                                  encoder_seq_lens=None) -> DecodeInputData:
 
         # NOTE(kzawora): the +1 is what causes this entire thing to work,
         # as in the paged attention, we don't fetch just the context from cache,
@@ -2584,6 +2670,42 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
+        # Build cross-attention (encoder K/V) block metadata for encoder-decoder models.
+        cross_block_list_device = None
+        cross_block_groups_device = None
+        cross_block_usage_device = None
+        encoder_seq_lens_list = None
+        encoder_seq_lens_tensor = None
+        max_encoder_seq_len = None
+        if cross_block_table_cpu_tensor is not None and encoder_seq_lens is not None:
+            cross_block_tables_list = []
+            enc_lens_list = []
+            for i in range(num_decodes):
+                n_enc_blocks = round_up(int(encoder_seq_lens[i]), self.block_size) // self.block_size
+                cross_blocks_i = cross_block_table_cpu_tensor[i, :n_enc_blocks].tolist()
+                cross_block_tables_list.append(cross_blocks_i)
+                enc_lens_list.append(int(encoder_seq_lens[i]))
+            # Pad to batch size with empty tables for padding requests.
+            for _ in range(padded_batch_size - num_decodes):
+                cross_block_tables_list.append([])
+                enc_lens_list.append(0)
+
+            cross_block_list, cross_block_groups, cross_block_usage = \
+                self._get_cross_attn_habana_buffers(
+                    cross_block_tables_list[:num_decodes],
+                    enc_lens_list[:num_decodes],
+                    padded_batch_size * num_tokens,
+                )
+            cross_block_list_device = async_h2d_copy(cross_block_list, device=self.device)
+            cross_block_groups_device = async_h2d_copy(cross_block_groups, device=self.device)
+            cross_block_usage_device = async_h2d_copy(cross_block_usage, device=self.device)
+
+            encoder_seq_lens_list = enc_lens_list[:num_decodes]
+            max_encoder_seq_len = max(encoder_seq_lens_list) if encoder_seq_lens_list else 0
+            enc_lens_cpu = torch.tensor(enc_lens_list[:num_decodes], dtype=torch.int32, device='cpu',
+                                        pin_memory=self.pin_memory)
+            encoder_seq_lens_tensor = async_h2d_copy(enc_lens_cpu, device=self.device)
+
         attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
             block_list=block_list_device,
             block_usage=block_usage_device,
@@ -2600,6 +2722,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             state_indices_tensor=state_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
+            cross_block_list=cross_block_list_device,
+            cross_block_groups=cross_block_groups_device,
+            cross_block_usage=cross_block_usage_device,
+            encoder_seq_lens=encoder_seq_lens_list,
+            encoder_seq_lens_tensor=encoder_seq_lens_tensor,
+            max_encoder_seq_len=max_encoder_seq_len,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
@@ -2626,10 +2754,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 dummy_decode_input_data = self._create_dummy_decode_input_data()
                 return DecodeInputData(num_decodes=0), dummy_decode_input_data
             return DecodeInputData(num_decodes=0), None
+
+        cross_block_table_cpu_tensor = None
+        encoder_seq_lens = None
+        if self._cross_attn_group_id is not None:
+            cross_block_table_cpu_tensor = self.input_batch.block_table[self._cross_attn_group_id].get_cpu_tensor()
+            encoder_seq_lens = self.encoder_seq_lens_np[:num_decodes]
+
         return self._create_decode_input_data(
             num_decodes, num_scheduled_tokens, self.input_batch.num_computed_tokens_cpu[:num_decodes],
             self.input_batch.block_table[self._get_attention_group_id_for_hybrid()].get_cpu_tensor(),
-            scheduler_output), None
+            scheduler_output,
+            cross_block_table_cpu_tensor=cross_block_table_cpu_tensor,
+            encoder_seq_lens=encoder_seq_lens), None
 
     def _create_dummy_decode_input_data(self) -> DecodeInputData:
         # create dummy decode input data with batch size 1
@@ -4964,10 +5101,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
 
         req_id = f'{len(requests)}'
-        block_ids = [[block_id] *
-                     (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_layers > 0 else [[block_id] *
-                                                                                                       num_blocks]
+        # Build block_ids per KV cache group. For Mamba hybrids or encoder-decoder
+        # models with multiple KV cache groups, allocate blocks for each group.
+        num_non_enc_only_groups = len([
+            g for g in self.kv_cache_config.kv_cache_groups
+            if not isinstance(g.kv_cache_spec, EncoderOnlyAttentionSpec)
+        ])
+        if self.num_mamba_layers > 0 or num_non_enc_only_groups > 1:
+            block_ids = [[block_id] *
+                         (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
+                         for g in self.kv_cache_config.kv_cache_groups
+                         if not isinstance(g.kv_cache_spec, EncoderOnlyAttentionSpec)]
+        else:
+            block_ids = [[block_id] * num_blocks]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -6005,6 +6151,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._PAD_SLOT_ID = num_blocks * self.block_size
         self._MAMBA_PAD_BLOCK_ID = -1
         self._dummy_num_blocks = num_blocks
+
+        # Initialize cross-attention group tracking for encoder-decoder models.
+        self._cross_attn_group_id: Optional[int] = self._get_cross_attention_group_id()
+        if self._cross_attn_group_id is not None:
+            self.encoder_seq_lens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+        else:
+            self.encoder_seq_lens_np = None
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(self.get_kv_caches_4D(kv_caches))

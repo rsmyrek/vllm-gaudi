@@ -74,7 +74,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               last_chunk_indices_p=None,
                               state_indices_tensor=None,
                               query_start_loc=None,
-                              padding_mask_flat=None):
+                              padding_mask_flat=None,
+                              cross_slot_mapping=None):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -93,7 +94,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    state_indices_tensor=state_indices_tensor,
                    query_start_loc=query_start_loc,
                    query_start_loc_p=query_start_loc,
-                   padding_mask_flat=padding_mask_flat)
+                   padding_mask_flat=padding_mask_flat,
+                   cross_slot_mapping=cross_slot_mapping)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -111,7 +113,14 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              chunked_block_groups,
                              state_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             cross_block_list=None,
+                             cross_block_mapping=None,
+                             cross_block_groups=None,
+                             cross_block_usage=None,
+                             encoder_seq_lens=None,
+                             encoder_seq_lens_tensor=None,
+                             max_encoder_seq_len=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -133,4 +142,11 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    prep_initial_states=None,
                    state_indices_tensor=state_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   cross_block_list=cross_block_list,
+                   cross_block_mapping=cross_block_mapping,
+                   cross_block_groups=cross_block_groups,
+                   cross_block_usage=cross_block_usage,
+                   encoder_seq_lens=encoder_seq_lens,
+                   encoder_seq_lens_tensor=encoder_seq_lens_tensor,
+                   max_encoder_seq_len=max_encoder_seq_len)
