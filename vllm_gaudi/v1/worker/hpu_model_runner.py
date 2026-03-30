@@ -5416,6 +5416,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        # Log memory state before KV cache initialization
+        free_mem_before = HabanaMemoryProfiler.current_free_device_memory()
+        logger.info("KV cache initialization starting. Free device memory: %s", format_bytes(free_mem_before))
+
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
@@ -5598,6 +5602,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         pass
         else:  # non-hybrid scenario
+            # Log KV cache allocation details for debugging memory issues
+            total_kv_cache_tensors = len(kv_cache_config.kv_cache_tensors)
+            logger.info(
+                "Allocating KV caches for %d cache tensor groups (non-hybrid scenario). "
+                "num_blocks=%d", total_kv_cache_tensors, kv_cache_config.num_blocks)
+
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 for layer_name in kv_cache_tensor.shared_by:
                     # Get the correct spec for this layer
@@ -5632,6 +5642,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         min_val = torch.finfo(torch.bfloat16).tiny
                         kv_scales_shape = list(kv_cache_shape)
                         kv_scales_shape[-1] = 1
+
+                        # Log per-layer allocation size for debugging
+                        kv_cache_bytes = math.prod(kv_cache_shape) * get_dtype_size(dtype)
+                        logger.debug(
+                            "Allocating KV cache for layer %s: shape=%s, dtype=%s, "
+                            "estimated size=%s (key) + %s (value)",
+                            layer_name, kv_cache_shape, dtype,
+                            format_bytes(kv_cache_bytes),
+                            format_bytes(kv_cache_bytes) if v_cache_shape else "0B")
+
                         key_cache = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
                         # initialize scale tensor with minimal scale values
                         key_scales = \
@@ -5692,6 +5712,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # TODO: check if this one is needed; for now seems that not
         # if has_mamba:
         #     self._update_hybrid_attention_mamba_layout(kv_caches)
+
+        # Log memory state before synchronize - this is where OOM may occur
+        # if too much memory was allocated for KV caches
+        free_mem_before_sync = HabanaMemoryProfiler.current_free_device_memory()
+        logger.info(
+            "KV cache allocation complete. Synchronizing device. "
+            "Free memory before sync: %s, total KV cache layers: %d",
+            format_bytes(free_mem_before_sync), len(kv_caches))
 
         htorch.hpu.synchronize()
 

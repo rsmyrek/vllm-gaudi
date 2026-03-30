@@ -334,10 +334,32 @@ class HPUWorker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
+        # Log pre-allocation memory state for debugging OOM issues
+        free_mem = torch.hpu.mem_get_info()[0]
+        total_mem = torch.hpu.mem_get_info()[1]
+        logger.info(
+            "Before KV cache initialization: free_memory=%s, total_memory=%s, "
+            "requested num_blocks=%d, gpu_memory_utilization=%.2f",
+            format_bytes(free_mem), format_bytes(total_mem),
+            kv_cache_config.num_blocks, self.cache_config.gpu_memory_utilization)
+
         with HabanaMemoryProfiler() as m:
             self.kv_cache_config = kv_cache_config
-            self.model_runner.initialize_kv_cache(kv_cache_config)
-            torch.hpu.synchronize()
+            try:
+                self.model_runner.initialize_kv_cache(kv_cache_config)
+                torch.hpu.synchronize()
+            except RuntimeError as e:
+                # Enhanced error message for OOM during KV cache allocation
+                if "Allocation failed" in str(e):
+                    free_after = torch.hpu.mem_get_info()[0]
+                    logger.error(
+                        "KV cache allocation failed due to insufficient device memory. "
+                        "Free memory at failure: %s. "
+                        "Consider reducing --gpu-memory-utilization (current: %.2f), "
+                        "reducing --max-model-len, increasing --tensor-parallel-size, "
+                        "or setting VLLM_GRAPH_RESERVED_MEM to a lower value (e.g., 0.05).",
+                        format_bytes(free_after), self.cache_config.gpu_memory_utilization)
+                raise
         if len(self.model_runner.kv_caches) > 0:
             msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "
                    f"actual allocated num_blocks: "
