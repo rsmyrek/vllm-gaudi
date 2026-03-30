@@ -241,6 +241,14 @@ class HPUWorker(WorkerBase):
         if is_fake_hpu():
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             return fake_hpu_cache_alloc
+
+        # Log memory state before profile run for debugging
+        pre_profile_mem = torch.hpu.mem_get_info()
+        logger.info(
+            "Memory state before profile run: free=%s, total=%s, used=%.1f%%",
+            format_bytes(pre_profile_mem[0]), format_bytes(pre_profile_mem[1]),
+            ((pre_profile_mem[1] - pre_profile_mem[0]) / pre_profile_mem[1]) * 100)
+
         with HabanaMemoryProfiler() as m:
             self.model_runner.profile_run(initialize_only=True)
             torch.hpu.synchronize()
@@ -250,6 +258,13 @@ class HPUWorker(WorkerBase):
         # At this point we should've allocated the maximum workspace for all
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
+        total_hpu_memory = torch.hpu.mem_get_info()[1]
+
+        # Log memory state after profile run
+        logger.info(
+            "Memory state after profile run: free=%s, total=%s, used=%.1f%%",
+            format_bytes(free_hpu_memory), format_bytes(total_hpu_memory),
+            ((total_hpu_memory - free_hpu_memory) / total_hpu_memory) * 100)
 
         try:
             graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
@@ -353,14 +368,30 @@ class HPUWorker(WorkerBase):
                 if "Allocation failed" in str(e):
                     mem_info_after = torch.hpu.mem_get_info()
                     free_after, total_after = mem_info_after[0], mem_info_after[1]
+                    used_mem = total_after - free_after
+                    utilization_pct = (used_mem / total_after) * 100 if total_after > 0 else 0
+
+                    # Calculate estimated KV cache size for better diagnostics
+                    estimated_kv_size = 0
+                    for tensor in kv_cache_config.kv_cache_tensors:
+                        estimated_kv_size += tensor.size
+
                     logger.error(
-                        "KV cache allocation failed due to insufficient device memory. "
-                        "Free memory at failure: %s (total: %s). "
-                        "Consider reducing --gpu-memory-utilization (current: %.2f), "
-                        "reducing --max-model-len, increasing --tensor-parallel-size, "
-                        "or setting VLLM_GRAPH_RESERVED_MEM to a lower value (e.g., 0.05).",
-                        format_bytes(free_after), format_bytes(total_after),
-                        self.cache_config.gpu_memory_utilization)
+                        "KV cache allocation failed due to insufficient device memory.\n"
+                        "  Current memory state: free=%s, total=%s, used=%.1f%%\n"
+                        "  Requested KV cache: num_blocks=%d, estimated_total_size=%s\n"
+                        "  Configuration: gpu_memory_utilization=%.2f, tensor_parallel_size=%d\n"
+                        "Possible solutions (in order of effectiveness):\n"
+                        "  1. Increase --tensor-parallel-size (current: %d) to distribute model across more devices\n"
+                        "  2. Reduce --max-model-len to decrease KV cache size\n"
+                        "  3. Use --enforce-eager to avoid HPUGraph memory overhead\n"
+                        "  4. Set VLLM_GRAPH_RESERVED_MEM=0.0 (current default: 0.1)\n"
+                        "  5. If the model is still too large, it may not fit on this hardware configuration",
+                        format_bytes(free_after), format_bytes(total_after), utilization_pct,
+                        kv_cache_config.num_blocks, format_bytes(estimated_kv_size),
+                        self.cache_config.gpu_memory_utilization,
+                        self.parallel_config.tensor_parallel_size,
+                        self.parallel_config.tensor_parallel_size)
                 raise
         if len(self.model_runner.kv_caches) > 0:
             msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "
