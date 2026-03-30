@@ -5645,12 +5645,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                         # Log per-layer allocation size for debugging
                         kv_cache_bytes = math.prod(kv_cache_shape) * get_dtype_size(dtype)
+                        # Note: v_cache_shape equals kv_cache_shape when not using MLA
+                        v_cache_bytes = kv_cache_bytes if v_cache_shape is not None else 0
                         logger.debug(
                             "Allocating KV cache for layer %s: shape=%s, dtype=%s, "
-                            "estimated size=%s (key) + %s (value)",
+                            "estimated size=%s (key) + %s (value) = %s total",
                             layer_name, kv_cache_shape, dtype,
                             format_bytes(kv_cache_bytes),
-                            format_bytes(kv_cache_bytes) if v_cache_shape else "0B")
+                            format_bytes(v_cache_bytes),
+                            format_bytes(kv_cache_bytes + v_cache_bytes))
 
                         key_cache = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
                         # initialize scale tensor with minimal scale values
