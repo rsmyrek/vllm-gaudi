@@ -422,11 +422,15 @@ def generate_buckets(bs_range,
             return correct_for_max_model_len
 
     def get_max_bucket_per_query(bs, query):
-        return (bs, query, math.ceil((max_model_len - query) // block_size))
+        edge_ctx = math.ceil((max_model_len - query) // block_size)
+        if max_blocks is not None:
+            edge_ctx = min(edge_ctx, max_blocks)
+        return (bs, query, edge_ctx)
 
     def is_ctx_allowed(ctx):
         ctx_bucket_max = get_config().VLLM_PROMPT_CTX_BUCKET_MAX
-        return ctx >= 0 and (ctx_bucket_max is None or ctx < ctx_bucket_max)
+        return (ctx >= 0 and (max_blocks is None or ctx <= max_blocks)
+                and (ctx_bucket_max is None or ctx < ctx_bucket_max))
 
     buckets = set()
     buckets_2d = set()
@@ -449,9 +453,10 @@ def generate_buckets(bs_range,
             is_max_ctx = ctx == max_ctx
             for query in query_range:
                 if is_prompt and is_max_ctx and max_model_len >= LONG_CTX_THRESHOLD:  # only for long ctx
-                    bs, query, edge_ctx = get_max_bucket_per_query(bs, query)
-                    if is_ctx_allowed(edge_ctx):
-                        ctx = edge_ctx
+                    bs, query, ctx = get_max_bucket_per_query(bs, query)
+                if is_prompt and not is_ctx_allowed(ctx):
+                    omitted_buckets.add(("condition: ctx <= max_blocks", "-> bs, query, ctx: ", bs, query, ctx))
+                    continue
                 if all(bucket_filter(bs, query, ctx) for bucket_filter in filters):
                     buckets.add(corrector(bs, query, ctx))
     if not buckets:

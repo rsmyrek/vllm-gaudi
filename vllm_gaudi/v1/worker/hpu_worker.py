@@ -309,13 +309,18 @@ class HPUWorker(WorkerBase):
             total_real = real_attn + real_mamba
             if total_real > padded_page:
                 factor = padded_page / total_real
-                adjusted = int(available * factor)
+                # Hybrid models allocate separate tensors for each spec type,
+                # so reserve the full dummy block headroom before converting
+                # back to padded-page units for upstream block calculation.
+                hybrid_dummy_block_headroom = math.ceil(dummy_block_headroom / factor)
+                adjusted = int(max(cache_size_bytes - hybrid_dummy_block_headroom, 0) * factor)
                 logger.info(
                     "HPU hybrid cache: reducing available KV cache "
                     "memory by %.1f%% (factor=%.3f) for separate "
                     "per-spec allocations (padded_page=%s, "
-                    "real_attn=%s, real_mamba=%s).", (1 - factor) * 100, factor, format_bytes(padded_page),
-                    format_bytes(real_attn), format_bytes(real_mamba))
+                    "real_attn=%s, real_mamba=%s, "
+                    "hybrid_dummy_block_headroom=%s).", (1 - factor) * 100, factor, format_bytes(padded_page),
+                    format_bytes(real_attn), format_bytes(real_mamba), format_bytes(hybrid_dummy_block_headroom))
                 available = adjusted
 
         return available

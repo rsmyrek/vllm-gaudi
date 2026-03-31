@@ -350,6 +350,32 @@ def test_real_scenario_fallback_ctx_4026_not_truncated():
 
 
 @patch('vllm_gaudi.extension.bucketing.exponential.get_config')
+def test_prompt_buckets_cap_long_context_by_num_hpu_blocks(mock_get_config):
+    """Long-context prompt warmup must not prepare buckets past KV cache capacity."""
+    mock_get_config.return_value = _MockConfig(use_contiguous_pa=False,
+                                               merged_prefill=False,
+                                               VLLM_PROMPT_QUERY_BUCKET_MIN=None,
+                                               VLLM_PROMPT_CTX_BUCKET_MAX=None)
+    strategy = ExponentialBucketingStrategy()
+
+    max_model_len = 262144
+    max_num_batched_tokens = 2048
+    block_size = 128
+    max_blocks = 512
+    bs_cfg, query_cfg, ctx_cfg = strategy.get_prompt_cfgs(max_num_prefill_seqs=1,
+                                                          block_size=block_size,
+                                                          max_num_batched_tokens=max_num_batched_tokens,
+                                                          max_model_len=max_model_len)
+
+    buckets = generate_buckets(strategy.get_range(bs_cfg), strategy.get_range(query_cfg), strategy.get_range(ctx_cfg),
+                               True, max_model_len, 256, 1, max_num_batched_tokens, block_size, max_blocks)
+
+    assert max(ctx for _, _, ctx in buckets) == max_blocks
+    assert all(ctx <= max_blocks for _, _, ctx in buckets)
+    assert (1, block_size, max_blocks) in buckets
+
+
+@patch('vllm_gaudi.extension.bucketing.exponential.get_config')
 def test_real_scenario_prompt_cfg_matches_log(mock_get_config):
     """Verify prompt bucket config matches the real server log.
 
