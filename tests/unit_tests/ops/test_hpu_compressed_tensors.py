@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 import habana_frameworks.torch as htorch
+from types import SimpleNamespace
 from utils import get_data_path, create_row_parallel_linear, create_fused_moe
 from unittest.mock import MagicMock
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
@@ -397,6 +399,100 @@ def test_compressed_tensors_wna16_moe_method(default_vllm_config: None, dist_ini
 
     # Check correctness
     torch.testing.assert_close(ref_output, out, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("bridge_has_is_gated", [True, False], ids=["native_non_gated", "mirrored"])
+def test_compressed_tensors_wna16_moe_method_non_gated(default_vllm_config: None, dist_init, monkeypatch,
+                                                       bridge_has_is_gated):
+    """Non-gated (squared-ReLU) experts on the native int4 WNA16 MoE path.
+
+    With a bridge whose int4_fused_weights takes is_gated, w13 holds only the
+    I-wide up-projection and the kernel gets is_gated=False with the real
+    activation. Without it, w1 is mirrored into a 2I-wide w13 and the gated
+    kernel runs relu, which equals relu2 there. The kernel is replaced by a
+    recorder, so this checks the plumbing on any bridge.
+    """
+    import vllm_gaudi.ops.hpu_compressed_tensors as hpu_ct
+    monkeypatch.setattr(hpu_ct, "int4_moe_supports_non_gated", lambda: bridge_has_is_gated)
+    monkeypatch.setattr(hpu_ct, "get_config", lambda: SimpleNamespace(wna16_native_int4_moe=True))
+
+    config = {
+        'config_groups': {
+            'group_0': {
+                'input_activations': None,
+                'output_activations': None,
+                'targets': ['Linear'],
+                'weights': {
+                    'actorder': None,
+                    'block_structure': None,
+                    'dynamic': False,
+                    'group_size': 128,
+                    'num_bits': 4,
+                    'observer': 'minmax',
+                    'observer_kwargs': {},
+                    'strategy': 'group',
+                    'symmetric': True,
+                    'type': 'int'
+                }
+            }
+        },
+        'format': 'pack-quantized',
+        'global_compression_ratio': None,
+        'ignore': [],
+        'kv_cache_scheme': None,
+        'quant_method': 'compressed-tensors',
+        'quantization_status': 'compressed'
+    }
+    oot_op = create_fused_moe(CompressedTensorsConfig.from_config(config), activation="relu2_no_mul").to("hpu")
+    experts = oot_op.routed_experts
+    assert isinstance(experts.quant_method, HPUCompressedTensorsWNA16MoEMethod)
+
+    num_experts, intermediate = 128, 256  # create_fused_moe sizes
+    w13_rows = intermediate if bridge_has_is_gated else 2 * intermediate
+    assert experts.w13_weight_packed.shape[1] == w13_rows
+    assert experts.w13_weight_scale.shape[1] == w13_rows
+
+    # Fill only the up-projection, as vLLM's loader does for a non-gated checkpoint.
+    packed_cols = experts.w13_weight_packed.shape[2]
+    experts.w13_weight_packed.data[:, :intermediate].copy_(
+        torch.randint(-2**31, 2**31 - 1, (num_experts, intermediate, packed_cols), dtype=torch.int32))
+    experts.w13_weight_scale.data[:, :intermediate].fill_(0.01)
+    experts.w2_weight_packed.data.zero_()
+    experts.w2_weight_scale.data.fill_(0.01)
+    experts.quant_method.process_weights_after_loading(experts)
+
+    assert experts.moe_op.native_int4
+    assert experts.moe_op.is_gated is not bridge_has_is_gated
+    # Repacked w13 is [experts, hidden, rows / 8].
+    assert experts.w13_weight_packed.shape[2] == w13_rows // 8
+    if not bridge_has_is_gated:
+        half = intermediate // 8
+        torch.testing.assert_close(experts.w13_weight_packed[:, :, half:], experts.w13_weight_packed[:, :, :half])
+
+    calls = []
+
+    class _RecordingMoeOps:
+
+        @staticmethod
+        def int4_fused_weights(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros_like(kwargs["hidden_states"])
+
+    monkeypatch.setattr(torch.ops.hpu, "mixture_of_experts", _RecordingMoeOps)
+    hidden_states = torch.randn(4, 512, dtype=torch.bfloat16, device="hpu")
+    router_logits = torch.randn(4, num_experts, dtype=torch.bfloat16, device="hpu")
+    experts.quant_method.apply_monolithic(experts, hidden_states, router_logits)
+
+    assert len(calls) == 1
+    assert len(calls[0]["w12"]) == num_experts
+    assert calls[0]["w12"][0].shape[1] == w13_rows // 8
+    if bridge_has_is_gated:
+        assert calls[0]["is_gated"] is False
+        assert calls[0]["activation"] == "relu2"
+    else:
+        # Older bridges reject an unknown is_gated keyword, so it must be absent.
+        assert "is_gated" not in calls[0]
+        assert calls[0]["activation"] == "relu"
 
 
 def test_compressed_tensors_linear_method_w8a8int8_bf16fallback_static_per_channel(default_vllm_config: None,
