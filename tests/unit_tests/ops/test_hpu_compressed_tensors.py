@@ -491,8 +491,8 @@ def test_compressed_tensors_wna16_moe_method_non_gated_matches_dense_reference(d
                                                                                monkeypatch, native_int4):
     """Squared-ReLU (non-gated) experts on the real kernels against y = sum_k p_k * W2 relu(W1 x)^2.
 
-    Both the dequant path and the native int4 kernel are gated-only, so they run
-    the w1 -> w3 mirror; each must match the dense reference.
+    The dequant path and a gated-only int4 kernel run the w1 -> w3 mirror; an int4
+    kernel with is_gated runs non-gated directly. All must match the dense reference.
     """
     if native_int4 and not int4_moe_native_available():
         pytest.skip("this Habana PyTorch bridge has no mixture_of_experts.int4_fused_weights")
@@ -543,40 +543,13 @@ def test_compressed_tensors_wna16_moe_method_non_gated(default_vllm_config: None
     I-wide up-projection and the kernel gets is_gated=False with the real
     activation. Without it, w1 is mirrored into a 2I-wide w13 and the gated
     kernel runs relu, which equals relu2 there. The kernel is replaced by a
-    recorder, so this checks the plumbing on any bridge.
+    recorder, so this checks the plumbing and calling convention on any bridge.
     """
-    import vllm_gaudi.ops.hpu_compressed_tensors as hpu_ct
+    monkeypatch.setattr(hpu_ext_ops, "int4_moe_native_available", lambda: True)
     monkeypatch.setattr(hpu_ct, "int4_moe_supports_non_gated", lambda: bridge_has_is_gated)
     monkeypatch.setattr(hpu_ct, "get_config", lambda: SimpleNamespace(wna16_native_int4_moe=True))
 
-    config = {
-        'config_groups': {
-            'group_0': {
-                'input_activations': None,
-                'output_activations': None,
-                'targets': ['Linear'],
-                'weights': {
-                    'actorder': None,
-                    'block_structure': None,
-                    'dynamic': False,
-                    'group_size': 128,
-                    'num_bits': 4,
-                    'observer': 'minmax',
-                    'observer_kwargs': {},
-                    'strategy': 'group',
-                    'symmetric': True,
-                    'type': 'int'
-                }
-            }
-        },
-        'format': 'pack-quantized',
-        'global_compression_ratio': None,
-        'ignore': [],
-        'kv_cache_scheme': None,
-        'quant_method': 'compressed-tensors',
-        'quantization_status': 'compressed'
-    }
-    oot_op = create_fused_moe(CompressedTensorsConfig.from_config(config), activation="relu2_no_mul").to("hpu")
+    oot_op = create_fused_moe(_wna16_moe_quant_config(), activation="relu2_no_mul").to("hpu")
     experts = oot_op.routed_experts
     assert isinstance(experts.quant_method, HPUCompressedTensorsWNA16MoEMethod)
 
@@ -617,15 +590,21 @@ def test_compressed_tensors_wna16_moe_method_non_gated(default_vllm_config: None
     experts.quant_method.apply_monolithic(experts, hidden_states, router_logits)
 
     assert len(calls) == 1
-    assert len(calls[0]["w12"]) == num_experts
-    assert calls[0]["w12"][0].shape[1] == w13_rows // 8
+    call = calls[0]
+    assert len(call["w12"]) == len(call["w3"]) == len(call["d_scale_w12"]) == len(call["d_scale_w3"]) == num_experts
+    assert call["w12"][0].shape[1] == w13_rows // 8
+    # Signed nibbles after the load-time rebias, and no zero point for symmetric int4.
+    assert call["is_signed"] is True
+    assert call["zero_point_w12"] is None and call["zero_point_w3"] is None
+    assert call["permuted_weights"] is False
+    assert (call["experts_min"], call["experts_max"]) == (0, num_experts - 1)
     if bridge_has_is_gated:
-        assert calls[0]["is_gated"] is False
-        assert calls[0]["activation"] == "relu2"
+        assert call["is_gated"] is False
+        assert call["activation"] == "relu2"
     else:
         # Older bridges reject an unknown is_gated keyword, so it must be absent.
-        assert "is_gated" not in calls[0]
-        assert calls[0]["activation"] == "relu"
+        assert "is_gated" not in call
+        assert call["activation"] == "relu"
 
 
 def test_compressed_tensors_linear_method_w8a8int8_bf16fallback_static_per_channel(default_vllm_config: None,

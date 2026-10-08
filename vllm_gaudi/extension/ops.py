@@ -1573,6 +1573,16 @@ def int4_moe_native_available() -> bool:
     return _int4_moe_schema() is not None
 
 
+def int4_moe_supports_non_gated() -> bool:
+    """Whether the bridge's int4_fused_weights overload takes is_gated.
+
+    Without it the int4 kernel is gated-only, and non-gated experts need w1
+    mirrored into w3 (see HPUCompressedTensorsWNA16MoEMethod._mirror_w1_into_w3).
+    """
+    schema = _int4_moe_schema()
+    return schema is not None and any(arg.name == "is_gated" for arg in schema.arguments)
+
+
 # compressed-tensors stores 4-bit codes as uint4b8 (value + 8), while
 # int4_fused_weights reads signed two's-complement nibbles. (c - 8) & 0xF == c ^ 8
 # for 4 bits, so a whole int32-packed word converts with one XOR by 0x88888888.
@@ -1582,26 +1592,6 @@ _UINT4B8_TO_INT4_XOR = -2004318072  # 0x88888888 as a signed int32
 def rebias_uint4b8_to_int4_(packed: torch.Tensor) -> torch.Tensor:
     """In place: int32-packed uint4b8 codes -> signed int4 nibbles (self-inverse)."""
     return packed.bitwise_xor_(torch.tensor(_UINT4B8_TO_INT4_XOR, dtype=torch.int32, device=packed.device))
-
-
-_int4_moe_non_gated: Optional[bool] = None
-
-
-def int4_moe_supports_non_gated() -> bool:
-    """Whether the bridge's int4_fused_weights overload takes is_gated.
-
-    Without it the int4 kernel is gated-only, and non-gated experts need w1
-    mirrored into w3 (see HPUCompressedTensorsWNA16MoEMethod._mirror_w1_into_w3).
-    """
-    global _int4_moe_non_gated
-    if _int4_moe_non_gated is None:
-        try:
-            schema = torch.ops.hpu.mixture_of_experts.int4_fused_weights._schema
-            _int4_moe_non_gated = any(arg.name == "is_gated" for arg in schema.arguments)
-        except (AttributeError, RuntimeError):
-            # Bridge predates the int4_fused_weights overload altogether.
-            _int4_moe_non_gated = False
-    return _int4_moe_non_gated
 
 
 class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):

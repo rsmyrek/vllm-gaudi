@@ -840,10 +840,11 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
 
         Decided before loading because it sets the w13 width: I rows (the single
         up-projection) on this path, 2I rows with w1 mirrored into w3 on every
-        other path, which only has gated kernels. Mirrors the eligibility rule of
-        VllmMixtureOfExpertsOpWNA16.supports_native_int4, which refuses only g_idx.
+        other path, which only has gated kernels. Must agree with the eligibility
+        decided in process_weights_after_loading: g_idx only exists for
+        actorder "group", and an is_gated-capable overload is also present.
         """
-        return (not layer.moe_config.is_act_and_mul and get_config().wna16_native_int4_moe and self.actorder != "group"
+        return (not layer.moe_config.is_act_and_mul and self._native_int4_refusal() is None and self.actorder != "group"
                 and int4_moe_supports_non_gated())
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int, hidden_size: int,
